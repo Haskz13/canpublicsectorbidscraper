@@ -1,0 +1,145 @@
+# docker-compose.yml
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: procurement_db
+    environment:
+      POSTGRES_USER: procurement_user
+      POSTGRES_PASSWORD: procurement_pass
+      POSTGRES_DB: procurement_scanner
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U procurement_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and job queue
+  redis:
+    image: redis:7-alpine
+    container_name: procurement_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: procurement_api
+    depends_on:
+      - postgres
+      - redis
+      - selenium-hub
+    environment:
+      DATABASE_URL: postgresql://procurement_user:procurement_pass@postgres:5432/procurement_scanner
+      REDIS_URL: redis://redis:6379
+      SELENIUM_HUB_URL: http://selenium-hub:4444/wd/hub
+      PYTHONUNBUFFERED: 1
+      TZ: America/Toronto
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python main.py
+
+  # Selenium Grid Hub
+  selenium-hub:
+    image: selenium/hub:4.15.0
+    container_name: selenium_hub
+    ports:
+      - "4444:4444"
+      - "4442:4442"
+      - "4443:4443"
+    environment:
+      SE_NODE_MAX_SESSIONS: 4
+      SE_NODE_SESSION_TIMEOUT: 86400
+      GRID_MAX_SESSION: 4
+
+  # Selenium Chrome Node
+  selenium-chrome:
+    image: selenium/node-chrome:4.15.0
+    depends_on:
+      - selenium-hub
+    environment:
+      SE_EVENT_BUS_HOST: selenium-hub
+      SE_EVENT_BUS_PUBLISH_PORT: 4442
+      SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+      SE_NODE_MAX_SESSIONS: 4
+      NODE_MAX_SESSION: 4
+      NODE_MAX_INSTANCES: 4
+      SE_NODE_OVERRIDE_MAX_SESSIONS: true
+      SE_NODE_SESSION_TIMEOUT: 86400
+    volumes:
+      - /dev/shm:/dev/shm
+    deploy:
+      replicas: 2
+
+  # Celery worker for background jobs
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: procurement_celery
+    depends_on:
+      - postgres
+      - redis
+      - selenium-hub
+    environment:
+      DATABASE_URL: postgresql://procurement_user:procurement_pass@postgres:5432/procurement_scanner
+      REDIS_URL: redis://redis:6379
+      SELENIUM_HUB_URL: http://selenium-hub:4444/wd/hub
+      TZ: America/Toronto
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: celery -A tasks worker --loglevel=info
+
+  # Celery beat for scheduled tasks
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: procurement_beat
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql://procurement_user:procurement_pass@postgres:5432/procurement_scanner
+      REDIS_URL: redis://redis:6379
+      TZ: America/Toronto
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    command: celery -A tasks beat --loglevel=info
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: procurement_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    environment:
+      API_URL: http://backend:8000
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: procurement_network
